@@ -50,6 +50,14 @@ FINDOCRAG_REPO_URL = (
 )
 FINDOCRAG_DOCS_SUBDIR = "FinDoc-RAG_data/documents"
 
+# FinanceBench open-source questions JSONL (GitHub, contains evidence with
+# full-page text that we use to reconstruct per-document context)
+FINANCEBENCH_QUESTIONS_URL = (
+    "https://raw.githubusercontent.com/patronus-ai/financebench/"
+    "main/data/financebench_open_source.jsonl"
+)
+
+
 # Sturdy training parameters
 INDEX_PREFIX = "bulk_train"
 MAX_PARAGRAPH_LENGTH = 1024
@@ -181,14 +189,149 @@ def load_findocrag() -> pd.DataFrame:
 
 
 # =============================================================================
-# 3.  TRAIN Sturdy Statistics indices
+# 3.  LOAD FinanceBench — download JSONL, reconstruct documents from evidence 
 # =============================================================================
 
-def make_index_name(row: pd.Series) -> str:
-    """Deterministic, collision-free index name."""
-    ds_tag = row["dataset_name"].lower().replace("-", "")  # docfinqa / findocrag
-    return f"{INDEX_PREFIX}_{ds_tag}_{row['doc_index']}"
 
+def load_financebench() -> pd.DataFrame:
+    """
+    Download the FinanceBench open-source JSONL from GitHub and reconstruct
+    per-document context from the evidence_text_full_page fields.
+
+    Each question may reference one or more pages of a financial document.
+    We group by unique document name and concatenate the full-page evidence
+    texts (deduplicated by page number, ordered by page) to form the
+    best-available document context.
+
+    Note: the full source PDFs live at
+    https://github.com/patronus-ai/financebench/tree/main/pdfs
+    This function uses the full-page evidence text already extracted in
+    the JSONL rather than re-parsing the PDFs.
+
+    Returns a DataFrame with one row per unique document:
+        dataset_name    : "FinanceBench"
+        doc_index       : 0-based index of the unique document
+        doc_name        : unique document identifier (e.g. "AMZN_2022_10K")
+        financebench_ids: comma-separated financebench_id values referencing
+                          this document
+        context         : reconstructed document text from full-page evidence
+        context_hash    : SHA-256 of the reconstructed text
+    """
+    print("=" * 70)
+    print("STEP 1c: Downloading FinanceBench from GitHub")
+    print("=" * 70)
+    print(f"URL: {FINANCEBENCH_QUESTIONS_URL}\n")
+
+
+    # ---- download and parse JSONL ----
+    resp = requests.get(FINANCEBENCH_QUESTIONS_URL)
+    resp.raise_for_status()
+
+
+    questions = []
+    for line in resp.text.strip().split("\n"):
+        line = line.strip()
+        if line:
+            questions.append(json.loads(line))
+
+
+    print(f"  Parsed {len(questions)} question records")
+
+
+    # ---- extract unique document pages from evidence ----
+    # doc_name -> {page_num: full_page_text}
+    doc_pages: dict[str, dict[int, str]] = {}
+    # doc_name -> set of financebench_ids
+    doc_question_ids: dict[str, set] = {}
+
+
+    for q in questions:
+        fb_id = q.get("financebench_id", "")
+        evidence_list = q.get("evidence", [])
+
+
+        for ev in evidence_list:
+            doc_name = ev.get("evidence_doc_name", "")
+            page_num = ev.get("evidence_page_num", 0)
+            full_page = ev.get("evidence_text_full_page", "")
+
+
+            if not doc_name or not full_page:
+                continue
+
+
+            if doc_name not in doc_pages:
+                doc_pages[doc_name] = {}
+                doc_question_ids[doc_name] = set()
+
+
+            doc_question_ids[doc_name].add(str(fb_id))
+
+
+            # Keep the first occurrence of each page
+            if page_num not in doc_pages[doc_name]:
+                doc_pages[doc_name][page_num] = full_page
+
+
+    print(f"  Unique documents (from evidence): {len(doc_pages)}")
+
+
+    # ---- build DataFrame ----
+    rows = []
+    for doc_index, doc_name in enumerate(sorted(doc_pages.keys())):
+        pages = doc_pages[doc_name]
+        # Concatenate pages in page-number order
+        context = "\n\n".join(
+            pages[p] for p in sorted(pages.keys()) if pages[p]
+        )
+        rows.append({
+            "dataset_name": "FinanceBench",
+            "doc_index": doc_index,
+            "doc_name": doc_name,
+            "financebench_ids": ",".join(sorted(
+                doc_question_ids[doc_name]
+            )),
+            "context": context,
+            "context_hash": hashlib.sha256(
+                context.encode("utf-8")
+            ).hexdigest(),
+        })
+
+
+    df = pd.DataFrame(rows)
+    print(f"FinanceBench document DataFrame ready: {len(df)} rows\n")
+    return df
+
+
+
+# =============================================================================
+# 4.  TRAIN Sturdy Statistics indices
+# =============================================================================
+
+def _sanitize_name_part(s: str) -> str:
+    """Lowercase, strip extension, replace non-alphanumeric chars with '_'."""
+    s = s.lower().rsplit(".", 1)[0]          # drop file extension if present
+    return "".join(c if c.isalnum() else "_" for c in s).strip("_")
+
+
+def make_index_name(row: pd.Series) -> str:
+    """Deterministic, collision-free index name.
+
+    Format:
+        DocFinQA     : {PREFIX}_docfinqa_{doc_index}
+        FinDoc-RAG   : {PREFIX}_findocrag_{doc_index}_{filename_stem}
+        FinanceBench : {PREFIX}_financebench_{doc_index}_{doc_name}
+    """
+    ds_tag = row["dataset_name"].lower().replace("-", "")  # docfinqa / findocrag / financebench
+    base = f"{INDEX_PREFIX}_{ds_tag}_{row['doc_index']}"
+
+    # Append the document-level identifier when available
+    if row["dataset_name"] == "FinDoc-RAG" and pd.notna(row.get("filename")):
+        base += f"_{_sanitize_name_part(row['filename'])}"
+    elif row["dataset_name"] == "FinanceBench" and pd.notna(row.get("doc_name")):
+        base += f"_{_sanitize_name_part(row['doc_name'])}"
+
+    return base
 
 def train_one_index(row: pd.Series) -> dict:
     """Train a single Sturdy Statistics index model for one document."""
@@ -250,26 +393,32 @@ def train_one_index(row: pd.Series) -> dict:
 
 
 # =============================================================================
-# 4.  MAIN
+# 5.  MAIN
 # =============================================================================
 
 def main():
-    # ---- Load both datasets ----
+    # ---- Load all three datasets ----
     df_docfinqa = load_docfinqa()
     df_findocrag = load_findocrag()
+    df_financebench = load_financebench()
 
     # ---- Combine into a single training queue ----
-    # Align columns: DocFinQA has original_row_indices; FinDoc-RAG has filename.
-    # We keep both columns; they'll be NaN where not applicable.
-    df_all = pd.concat([df_docfinqa, df_findocrag], ignore_index=True)
+    # Align columns: DocFinQA has original_row_indices; FinDoc-RAG has
+    # filename; FinanceBench has doc_name and financebench_ids.
+    # We keep all columns; they'll be NaN where not applicable.
+    df_all = pd.concat(
+        [df_docfinqa, df_findocrag, df_financebench], ignore_index=True
+    )
     df_all["index_name"] = df_all.apply(make_index_name, axis=1)
+
 
     print("=" * 70)
     print(f"STEP 2: Training {len(df_all)} Sturdy indices")
     print("=" * 70)
-    print(f"  DocFinQA documents:  {len(df_docfinqa)}")
-    print(f"  FinDoc-RAG documents: {len(df_findocrag)}")
-    print(f"  Total:                {len(df_all)}")
+    print(f"  DocFinQA documents:    {len(df_docfinqa)}")
+    print(f"  FinDoc-RAG documents:  {len(df_findocrag)}")
+    print(f"  FinanceBench documents: {len(df_financebench)}")
+    print(f"  Total:                  {len(df_all)}")
     print()
 
     # ---- Train each index ----
