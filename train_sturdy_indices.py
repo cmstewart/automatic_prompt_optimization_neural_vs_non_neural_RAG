@@ -251,7 +251,7 @@ def load_financebench() -> pd.DataFrame:
 
 
         for ev in evidence_list:
-            doc_name = ev.get("evidence_doc_name", "")
+            doc_name = ev.get("doc_name", "")
             page_num = ev.get("evidence_page_num", 0)
             full_page = ev.get("evidence_text_full_page", "")
 
@@ -334,13 +334,12 @@ def make_index_name(row: pd.Series) -> str:
     return base
 
 def train_one_index(row: pd.Series) -> dict:
-    """Train a single Sturdy Statistics index model for one document."""
+    """Submit a single Sturdy Statistics training job for one document."""
     index_name = make_index_name(row)
-
-    print(f"\n  [{row.name + 1}] Training: {index_name}")
-    print(f"       Dataset:        {row['dataset_name']}")
-    print(f"       Doc index:      {row['doc_index']}")
-    print(f"       Context length: {len(row['context']):,} chars")
+    print(f"\\n  [{row.name + 1}] Submitting: {index_name}")
+    print(f"      Dataset: {row['dataset_name']}")
+    print(f"      Doc index: {row['doc_index']}")
+    print(f"      Context length: {len(row['context']):,} chars")
 
     # --- guard: abort if index already exists ---
     try:
@@ -348,7 +347,7 @@ def train_one_index(row: pd.Series) -> dict:
             name="_check", API_key=STURDY_API_KEY
         ).listIndices(name_filter=index_name)
         if len(existing) > 0:
-            print(f"       ⚠ Index already exists — skipping.")
+            print(f"      ⚠ Index already exists — skipping.")
             return {
                 "index_name": index_name,
                 "dataset_name": row["dataset_name"],
@@ -359,30 +358,23 @@ def train_one_index(row: pd.Series) -> dict:
         pass  # listIndices may fail on a fresh account; continue anyway
 
     try:
-        start = time.time()
-
         idx = Index(name=index_name, API_key=STURDY_API_KEY)
         idx.upload([{"doc": row["context"]}])
-        idx.train(
+        job = idx.train(
             fast=False,
             regex_paragraph_splitter=REGEX_SPLITTER,
             max_paragraph_length=MAX_PARAGRAPH_LENGTH,
-            wait=True,
+            wait=False,
         )
-
-        elapsed = time.time() - start
-        print(f"       ✓ Done in {elapsed:.1f}s")
-
+        print(f"      ✓ Job submitted")
         return {
             "index_name": index_name,
             "dataset_name": row["dataset_name"],
             "doc_index": row["doc_index"],
-            "status": "success",
-            "train_time_sec": round(elapsed, 1),
+            "status": "submitted",
         }
-
     except Exception as e:
-        print(f"       ✗ Error: {e}")
+        print(f"      ✗ Error: {e}")
         return {
             "index_name": index_name,
             "dataset_name": row["dataset_name"],
@@ -390,7 +382,6 @@ def train_one_index(row: pd.Series) -> dict:
             "status": "error",
             "error": str(e),
         }
-
 
 # =============================================================================
 # 5.  MAIN
