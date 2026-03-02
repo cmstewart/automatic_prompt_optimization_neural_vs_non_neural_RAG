@@ -3,6 +3,7 @@
 Train Sturdy Statistics index models for every unique document in:
   1. DocFinQA  (https://huggingface.co/datasets/kensho/DocFinQA)
   2. FinDoc-RAG (https://gitlab-core.supsi.ch/dti-idsia/ai-finance-papers/findoc-rag/-/tree/main/FinDoc-RAG_data/documents?ref_type=heads)
+  3. FinanceBench (https://raw.githubusercontent.com/patronus-ai/financebench/)
 
 Outputs a CSV manifest mapping each trained index back to its source
 dataset, row numbers, and training metadata. This is to facilitate
