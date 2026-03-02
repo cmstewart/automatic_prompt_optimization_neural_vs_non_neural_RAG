@@ -323,7 +323,7 @@ def make_index_name(row: pd.Series) -> str:
         FinDoc-RAG   : {PREFIX}_findocrag_{doc_index}_{filename_stem}
         FinanceBench : {PREFIX}_financebench_{doc_index}_{doc_name}
     """
-    ds_tag = row["dataset_name"].lower().replace("-", "")  # docfinqa / findocrag / financebench
+    ds_tag = row["dataset_name"].lower().replace("-", "")
     base = f"{INDEX_PREFIX}_{ds_tag}_{row['doc_index']}"
 
     # Append the document-level identifier when available
@@ -356,7 +356,7 @@ def train_one_index(row: pd.Series) -> dict:
                 "status": "skipped_exists",
             }
     except Exception:
-        pass  # listIndices may fail on a fresh account; continue anyway
+        pass
 
     try:
         idx = Index(name=index_name, API_key=STURDY_API_KEY)
