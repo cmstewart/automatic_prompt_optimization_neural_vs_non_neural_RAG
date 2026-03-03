@@ -3,7 +3,6 @@
 Train Sturdy Statistics index models for every unique document in:
   1. DocFinQA  (https://huggingface.co/datasets/kensho/DocFinQA)
   2. FinDoc-RAG (https://gitlab-core.supsi.ch/dti-idsia/ai-finance-papers/findoc-rag/-/tree/main/FinDoc-RAG_data/documents?ref_type=heads)
-  3. FinanceBench (https://raw.githubusercontent.com/patronus-ai/financebench/)
 
 Outputs a CSV manifest mapping each trained index back to its source
 dataset, row numbers, and training metadata. This is to facilitate
@@ -60,9 +59,10 @@ FINANCEBENCH_QUESTIONS_URL = (
 
 
 # Sturdy training parameters
-INDEX_PREFIX = "bulk_train"
+INDEX_NAME = "bulk_train_all_huge_model"
 MAX_PARAGRAPH_LENGTH = 1024
 REGEX_SPLITTER = "donotsplitzzzzuuid"
+BURN_IN = 5000
 
 # Output paths
 OUTPUT_DIR = Path("./output")
@@ -309,77 +309,50 @@ def load_financebench() -> pd.DataFrame:
 # 4.  TRAIN Sturdy Statistics indices
 # =============================================================================
 
-def _sanitize_name_part(s: str) -> str:
-    """Lowercase, strip extension, replace non-alphanumeric chars with '_'."""
-    s = s.lower().rsplit(".", 1)[0]          # drop file extension if present
-    return "".join(c if c.isalnum() else "_" for c in s).strip("_")
-
-
-def make_index_name(row: pd.Series) -> str:
-    """Deterministic, collision-free index name.
-
-    Format:
-        DocFinQA     : {PREFIX}_docfinqa_{doc_index}
-        FinDoc-RAG   : {PREFIX}_findocrag_{doc_index}_{filename_stem}
-        FinanceBench : {PREFIX}_financebench_{doc_index}_{doc_name}
-    """
-    ds_tag = row["dataset_name"].lower().replace("-", "")
-    base = f"{INDEX_PREFIX}_{ds_tag}_{row['doc_index']}"
-
-    # Append the document-level identifier when available
-    if row["dataset_name"] == "FinDoc-RAG" and pd.notna(row.get("filename")):
-        base += f"_{_sanitize_name_part(row['filename'])}"
-    elif row["dataset_name"] == "FinanceBench" and pd.notna(row.get("doc_name")):
-        base += f"_{_sanitize_name_part(row['doc_name'])}"
-
-    return base
-
-def train_one_index(row: pd.Series) -> dict:
-    """Submit a single Sturdy Statistics training job for one document."""
-    index_name = make_index_name(row)
-    print(f"\\n  [{row.name + 1}] Submitting: {index_name}")
-    print(f"      Dataset: {row['dataset_name']}")
-    print(f"      Doc index: {row['doc_index']}")
-    print(f"      Context length: {len(row['context']):,} chars")
+def train_all_documents(df_all: pd.DataFrame) -> dict:
+    """Upload all documents to a single Sturdy Statistics index and train once."""
+    print(f"\n  Index name: {INDEX_NAME}")
+    print(f"  Total documents: {len(df_all)}")
 
     # --- guard: abort if index already exists ---
     try:
         existing = Index(
             name="_check", API_key=STURDY_API_KEY
-        ).listIndices(name_filter=index_name)
+        ).listIndices(name_filter=INDEX_NAME)
         if len(existing) > 0:
-            print(f"      ⚠ Index already exists — skipping.")
+            print(f"  ⚠ Index already exists — skipping.")
             return {
-                "index_name": index_name,
-                "dataset_name": row["dataset_name"],
-                "doc_index": row["doc_index"],
+                "index_name": INDEX_NAME,
                 "status": "skipped_exists",
             }
     except Exception:
-        pass
+        pass  # listIndices may fail on a fresh account; continue anyway
 
     try:
-        idx = Index(name=index_name, API_key=STURDY_API_KEY)
-        idx.upload([{"doc": row["context"]}])
+        idx = Index(name=INDEX_NAME, API_key=STURDY_API_KEY)
+
+        # Build the full list of document records for upload
+        docs = [{"doc": row["context"]} for _, row in df_all.iterrows()]
+        print(f"  Uploading {len(docs)} documents...")
+        idx.upload(docs)
+
+        print(f"  Training with burn_in={BURN_IN}...")
         job = idx.train(
+            params={"burn_in": BURN_IN},
             fast=False,
             regex_paragraph_splitter=REGEX_SPLITTER,
             max_paragraph_length=MAX_PARAGRAPH_LENGTH,
             wait=False,
         )
-        print(f"      ✓ Job submitted")
+        print(f"  ✓ Training job submitted")
         return {
-            "index_name": index_name,
-            "dataset_name": row["dataset_name"],
-            "doc_index": row["doc_index"],
+            "index_name": INDEX_NAME,
             "status": "submitted",
         }
     except Exception as e:
-        print(f"      ✗ Error: {e}")
+        print(f"  ✗ Error: {e}")
         return {
-            "index_name": index_name,
-            "dataset_name": row["dataset_name"],
-            "doc_index": row["doc_index"],
+            "index_name": INDEX_NAME,
             "status": "error",
             "error": str(e),
         }
@@ -394,62 +367,42 @@ def main():
     df_findocrag = load_findocrag()
     df_financebench = load_financebench()
 
-    # ---- Combine into a single training queue ----
+    # ---- Combine into a single DataFrame ----
     # Align columns: DocFinQA has original_row_indices; FinDoc-RAG has
     # filename; FinanceBench has doc_name and financebench_ids.
     # We keep all columns; they'll be NaN where not applicable.
     df_all = pd.concat(
         [df_docfinqa, df_findocrag, df_financebench], ignore_index=True
     )
-    df_all["index_name"] = df_all.apply(make_index_name, axis=1)
-
+    df_all["index_name"] = INDEX_NAME
 
     print("=" * 70)
-    print(f"STEP 2: Training {len(df_all)} Sturdy indices")
+    print(f"STEP 2: Training single Sturdy index with all {len(df_all)} documents")
     print("=" * 70)
     print(f"  DocFinQA documents:    {len(df_docfinqa)}")
     print(f"  FinDoc-RAG documents:  {len(df_findocrag)}")
     print(f"  FinanceBench documents: {len(df_financebench)}")
     print(f"  Total:                  {len(df_all)}")
+    print(f"  burn_in:                {BURN_IN}")
     print()
 
-    # ---- Train each index ----
-    results = []
-    for i, row in df_all.iterrows():
-        result = train_one_index(row)
-        results.append(result)
-
-    df_results = pd.DataFrame(results)
-
-    # ---- Merge training results back with source metadata ----
-    # Keep everything except the context text due to its size
-    df_manifest = df_all.drop(columns=["context"]).copy()
-
-    # Standardize df_results columns (some rows may lack optional fields)
-    for col in ("train_time_sec", "error"):
-        if col not in df_results.columns:
-            df_results[col] = None
-
-    df_manifest = df_manifest.merge(
-        df_results[["index_name", "status", "train_time_sec", "error"]],
-        on="index_name",
-        how="left",
-    )
+    # ---- Upload all documents and train a single index ----
+    result = train_all_documents(df_all)
 
     # ---- Write manifest CSV ----
+    df_manifest = df_all.drop(columns=["context"]).copy()
+    df_manifest["status"] = result["status"]
+    df_manifest["error"] = result.get("error")
     df_manifest.to_csv(MANIFEST_CSV, index=False)
 
     # ---- Summary ----
-    n_ok = (df_manifest["status"] == "success").sum()
-    n_skip = (df_manifest["status"] == "skipped_exists").sum()
-    n_err = (df_manifest["status"] == "error").sum()
-
     print("\n" + "=" * 70)
     print("TRAINING COMPLETE")
     print("=" * 70)
-    print(f"  Successful:  {n_ok}")
-    print(f"  Skipped:     {n_skip}")
-    print(f"  Errors:      {n_err}")
+    print(f"  Index:   {INDEX_NAME}")
+    print(f"  Status:  {result['status']}")
+    if "error" in result:
+        print(f"  Error:   {result['error']}")
     print(f"\nManifest CSV written to: {MANIFEST_CSV}")
     print(f"Columns: {df_manifest.columns.tolist()}")
 
